@@ -5,7 +5,9 @@
     <ReleaseChannel Condition="'$(ReleaseChannel)' == ''">stable</ReleaseChannel>
     <ReleaseTag Condition="'$(ReleaseTag)' == ''">v$(Version)</ReleaseTag>
     <GitHubReleaseRoot Condition="'$(GitHubReleaseRoot)' == ''">$(MSBuildThisFileDirectory)../../Releases</GitHubReleaseRoot>
-    <RuntimeIdentifier Condition="'$(RuntimeIdentifier)' == '' and '$(_IsPublishing)' == 'true'">$(NETCoreSdkRuntimeIdentifier)</RuntimeIdentifier>
+    <RuntimeIdentifiers Condition="'$(RuntimeIdentifiers)' == '' and '$(RuntimeIdentifier)' == ''">$(NETCoreSdkRuntimeIdentifier)</RuntimeIdentifiers>
+    <RuntimeIdentifier Condition="'$(RuntimeIdentifier)' == '' and ('$(_IsPublishing)' == 'true' or '$(PublishProfile)' != '' or '$(WebPublishProfileFile)' != '')"
+                       >$(NETCoreSdkRuntimeIdentifier)</RuntimeIdentifier>
     <_PublicationRid>$(RuntimeIdentifier)</_PublicationRid>
     <_PublicationRid Condition="'$(_PublicationRid)' == ''">$(NETCoreSdkRuntimeIdentifier)</_PublicationRid>
     <VelopackChannel>$(_PublicationRid)-$(ReleaseChannel)</VelopackChannel>

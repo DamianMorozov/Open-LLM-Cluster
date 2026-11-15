@@ -11,7 +11,8 @@ public sealed class PublicationTests
     public async Task PublishUsesVersionedReleaseFolderAndExternalRuntimes(string rid)
     {
         var result = await RunMsBuildAsync($"-p:RuntimeIdentifier={rid}", "-p:_IsPublishing=true",
-            "-getProperty:PublishDir,GitHubReleaseDir,Version,SelfContained,PublishTrimmed,PublishAot,UseAppHost,VelopackChannel,VelopackPackId,MacOSBundleId");
+            "-getProperty:PublishDir,GitHubReleaseDir,Version,SelfContained,PublishTrimmed,PublishAot,UseAppHost," +
+            "VelopackChannel,VelopackPackId,MacOSBundleId,RuntimeIdentifiers");
         Assert.Equal(0, result.ExitCode);
         using var json = JsonDocument.Parse(result.Output);
         var properties = json.RootElement.GetProperty("Properties");
@@ -20,6 +21,7 @@ public sealed class PublicationTests
         Assert.Equal(expected, Path.TrimEndingDirectorySeparator(Path.GetFullPath(properties.GetProperty("GitHubReleaseDir").GetString()!)));
         Assert.Equal(Path.Combine(expected, "publish"), Path.TrimEndingDirectorySeparator(Path.GetFullPath(properties.GetProperty("PublishDir").GetString()!)));
         Assert.Equal("false", properties.GetProperty("SelfContained").GetString());
+        Assert.Equal("", properties.GetProperty("RuntimeIdentifiers").GetString());
         Assert.Equal("true", properties.GetProperty("UseAppHost").GetString());
         Assert.Equal("false", properties.GetProperty("PublishTrimmed").GetString());
         Assert.Equal("false", properties.GetProperty("PublishAot").GetString());
@@ -52,11 +54,13 @@ public sealed class PublicationTests
     [Fact]
     public async Task OrdinaryBuildRemainsFrameworkDependent()
     {
-        var result = await RunMsBuildAsync("-getProperty:SelfContained,RuntimeIdentifier");
+        var result = await RunMsBuildAsync("-getProperty:SelfContained,RuntimeIdentifier,RuntimeIdentifiers,NETCoreSdkRuntimeIdentifier");
         Assert.Equal(0, result.ExitCode);
         using var json = JsonDocument.Parse(result.Output);
         Assert.Equal("false", json.RootElement.GetProperty("Properties").GetProperty("SelfContained").GetString());
         Assert.Equal("", json.RootElement.GetProperty("Properties").GetProperty("RuntimeIdentifier").GetString());
+        var properties = json.RootElement.GetProperty("Properties");
+        Assert.Equal(properties.GetProperty("NETCoreSdkRuntimeIdentifier").GetString(), properties.GetProperty("RuntimeIdentifiers").GetString());
     }
 
     [Fact]
@@ -72,6 +76,36 @@ public sealed class PublicationTests
         Assert.EndsWith(Path.Combine(rid, "publish"), Path.TrimEndingDirectorySeparator(Path.GetFullPath(properties.GetProperty("PublishDir").GetString()!)));
     }
 
+    [Theory]
+    [InlineData("PublishProfile")]
+    [InlineData("WebPublishProfileFile")]
+    public async Task VisualStudioFolderProfileUsesSdkHostWithoutDotnetPublishFlag(string property)
+    {
+        var directory = Path.Combine(Path.GetTempPath(), "olc-vs-profile-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(directory);
+        var profile = Path.Combine(directory, "Folder.pubxml");
+        await File.WriteAllTextAsync(profile, """
+            <Project>
+              <PropertyGroup>
+                <PublishProtocol>FileSystem</PublishProtocol>
+                <_TargetId>Folder</_TargetId>
+                <SelfContained>false</SelfContained>
+              </PropertyGroup>
+            </Project>
+            """, TestContext.Current.CancellationToken);
+        try
+        {
+            var result = await RunMsBuildAsync("-p:" + property + "=" + profile, "-p:PublishProfileFullPath=" + profile, "-target:ValidatePublication",
+                "-getProperty:RuntimeIdentifier,NETCoreSdkRuntimeIdentifier,SelfContained");
+            Assert.True(result.ExitCode == 0, result.Output);
+            using var json = JsonDocument.Parse(result.Output);
+            var properties = json.RootElement.GetProperty("Properties");
+            Assert.Equal(properties.GetProperty("NETCoreSdkRuntimeIdentifier").GetString(), properties.GetProperty("RuntimeIdentifier").GetString());
+            Assert.Equal("false", properties.GetProperty("SelfContained").GetString());
+        }
+        finally { File.Delete(profile); Directory.Delete(directory); }
+    }
+
     [Fact]
     public void LibraryAndLocalToolUseSameStableVersion()
     {
@@ -83,6 +117,50 @@ public sealed class PublicationTests
         Assert.True(manifest.RootElement.GetProperty("isRoot").GetBoolean());
         Assert.Contains(manifest.RootElement.GetProperty("tools").GetProperty("vpk").GetProperty("commands").EnumerateArray(),
             command => command.GetString() == "vpk");
+    }
+
+    [Theory]
+    [InlineData("PublishProfile")]
+    [InlineData("WebPublishProfileFile")]
+    public async Task RestoreWithoutProfileSupportsLaterVisualStudioPublish(string property)
+    {
+        var root = RepositoryRoot();
+        var directory = Path.GetFullPath(Path.Combine(root, "..", "Artifacts", "publication-tests", Guid.NewGuid().ToString("N")));
+        Directory.CreateDirectory(directory);
+        var project = Path.Combine(directory, "RestoreThenPublish.csproj");
+        var profile = Path.Combine(directory, "Folder.pubxml");
+        var escapedRoot = System.Security.SecurityElement.Escape(root);
+        await File.WriteAllTextAsync(project, $"""
+            <Project Sdk="Microsoft.NET.Sdk">
+              <Import Project="{escapedRoot}/Directory.Build.props" />
+              <Import Project="{escapedRoot}/build/Publication.props" />
+              <Import Project="{escapedRoot}/build/Publication.targets" />
+            </Project>
+            """, TestContext.Current.CancellationToken);
+        await File.WriteAllTextAsync(profile, """
+            <Project>
+              <PropertyGroup>
+                <PublishProtocol>FileSystem</PublishProtocol>
+                <_TargetId>Folder</_TargetId>
+                <SelfContained>false</SelfContained>
+              </PropertyGroup>
+            </Project>
+            """, TestContext.Current.CancellationToken);
+        try
+        {
+            var restore = await RunProjectMsBuildAsync(project, "-restore", "-target:ResolvePackageAssets", "-p:Configuration=Release");
+            Assert.True(restore.ExitCode == 0, restore.Output);
+            var publish = await RunProjectMsBuildAsync(project, "-p:" + property + "=" + profile, "-p:PublishProfileFullPath=" + profile,
+                "-p:Configuration=Release", "-target:ValidatePublication,ResolvePackageAssets", "-getProperty:RuntimeIdentifier,TargetFramework");
+            Assert.True(publish.ExitCode == 0, publish.Output);
+            using var properties = JsonDocument.Parse(publish.Output);
+            var values = properties.RootElement.GetProperty("Properties");
+            var target = values.GetProperty("TargetFramework").GetString() + "/" + values.GetProperty("RuntimeIdentifier").GetString();
+            using var assets = JsonDocument.Parse(await File.ReadAllTextAsync(Path.Combine(directory, "obj", "project.assets.json"),
+                TestContext.Current.CancellationToken));
+            Assert.True(assets.RootElement.GetProperty("targets").TryGetProperty(target, out _), "Restore не подготовил зависимости для " + target);
+        }
+        finally { Directory.Delete(directory, recursive: true); }
     }
 
     [Theory]
@@ -132,10 +210,14 @@ public sealed class PublicationTests
 
     // Выполняет только вычисление свойств или раннюю проверку, без restore и компиляции
     private static async Task<(int ExitCode, string Output)> RunMsBuildAsync(params string[] arguments)
+        => await RunProjectMsBuildAsync(Path.Combine(RepositoryRoot(), "src", "OpenLLMCluster.Desktop", "OpenLLMCluster.Desktop.csproj"), arguments);
+
+    // Выполняет MSBuild для проекта, включая изолированную проверку последовательности restore и публикации
+    private static async Task<(int ExitCode, string Output)> RunProjectMsBuildAsync(string project, params string[] arguments)
     {
         var start = new ProcessStartInfo("dotnet") { WorkingDirectory = RepositoryRoot(), RedirectStandardOutput = true, RedirectStandardError = true };
         start.ArgumentList.Add("msbuild");
-        start.ArgumentList.Add("src/OpenLLMCluster.Desktop/OpenLLMCluster.Desktop.csproj");
+        start.ArgumentList.Add(project);
         start.ArgumentList.Add("-nologo");
         foreach (var argument in arguments) start.ArgumentList.Add(argument);
         using var process = Process.Start(start)!;
